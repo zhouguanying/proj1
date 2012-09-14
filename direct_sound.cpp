@@ -1,5 +1,5 @@
+#include "direct_sound.h"
 #include <dsound.h>
-#include "utility.h"
 #include <stdio.h>
 #include <dxerr9.h>
 #include <process.h>
@@ -8,29 +8,54 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "dxerr8.lib")
 
-#define NUM_REC_NOTIFICATIONS 16
-WAVEFORMATEX WaveDataFormat={WAVE_FORMAT_PCM, 1,8000,16000,2,16, 0}; 
+static IDirectSoundFullDuplex8 *_ds_fp;
+static LPDIRECTSOUNDCAPTUREBUFFER8 _ds_capture_buffer = 0;
+static LPDIRECTSOUNDBUFFER8 _ds_playback_buffer = 0;
+static HWND _hwnd = 0;
+static HANDLE _hnotify[2];
+static HANDLE _work_notify;
+static CRITICAL_SECTION _buf_lock;
+//play control
+static int _status_play = 0;
+static int _status_capture = 0;
+static int _status_playback = 0;
 
-IDirectSoundFullDuplex8 *_ds_fp;
-LPDIRECTSOUNDCAPTUREBUFFER8 _ds_capture_buffer = 0;
-LPDIRECTSOUNDBUFFER8 _ds_playback_buffer = 0;
-HWND _hwnd = 0;
-HANDLE _hnotify[2]; // 通知事件
-#define  BUFS 3
+// 开启ACE 经测试最小时间间隔为128
+#define BUFS 3
 #define FRAMESIZE (160)
+#define BUFSIZE (FRAMESIZE*2*2*2)
+#define SAMPLE_RATE 8000
+
+//处理音频数据的用户回调函数
+typedef int (*sound_data_handler_t)(void *userp, void *data, size_t data_len);
+static void *_capture_user = 0;
+static sound_data_handler_t _capture_handler = 0;
+static void *_playback_user = 0;
+static sound_data_handler_t _playback_handler = 0;
+static void set_handler(void *userp, sound_data_handler_t handler, int is_capture);
+
+void set_handler_capture(void *userp, sound_data_handler_t handler)
+{
+	set_handler(userp, handler, 1);
+}
+
+void set_handler_playback(void *userp, sound_data_handler_t handler)
+{
+	set_handler(userp, handler, 0);
+}
+
+
+// data buf
 DataChunk _capture_buf;
 DataChunk _playback_buf;
 
+// for demo
 SOCKET _sock_sender;
 SOCKET _sock_listen;
 char forge_addr[256];
 struct sockaddr_in _addr;
 
-CRITICAL_SECTION _buf_lock;
-
-// 数据使用 40ms，非常希望使用 20ms，但是看起来windows无法达到这个精度
-#define BUFSIZE (FRAMESIZE*2*2*2)
-int open_speaker_mic();
+static int open_speaker_mic();
 static unsigned __stdcall thread_work (void *param);
 static unsigned __stdcall thread_listen (void *param);
 
@@ -45,24 +70,25 @@ int send_pcm(char *data, int len)
 	return r;
 }
 
-int init_aec(HWND hwnd, char *faddr, unsigned short fport, unsigned short lport)
+static int demo_cap_handler(void *userp, void *data, size_t data_len)
 {
-	WSADATA data;
-	WSAStartup(0x202, &data);
-	CoInitialize(0);
+	return send_pcm((char *)data, data_len);
+}
 
-	HRESULT hr;
-	_hwnd = hwnd;
-	_hnotify[0] = CreateEvent(0, 0, 0, 0);
-	_hnotify[1] = CreateEvent(0, 0, 0, 0);
-	_playback_buf.allocate(BUFSIZE * 20);
+static int demo_pb_handler(void *userp, void *data, size_t data_len)
+{
+	return (int)_playback_buf.pop_front((unsigned char *)data, data_len);
+}
 
+// demo trans audio data
+static int init_udp_sock(char *faddr, unsigned short fport, unsigned short lport)
+{
 	struct sockaddr_in lo_addr;
 	memset(&lo_addr, 0, sizeof(lo_addr));
 	lo_addr.sin_addr.s_addr = INADDR_ANY;
 	lo_addr.sin_family = AF_INET;
 	lo_addr.sin_port = htons(lport);
-
+	
 	_sock_listen = socket(AF_INET, SOCK_DGRAM, 0);
 	if (bind(_sock_listen, (sockaddr*)&lo_addr, sizeof(lo_addr)) < 0) {
 		fprintf(stderr, "%s: bind %d err\n", "init_aec", lport);
@@ -71,7 +97,7 @@ int init_aec(HWND hwnd, char *faddr, unsigned short fport, unsigned short lport)
 		return -1;
 	}
 	printf("listen local port %u\n", lport);
-
+	
 	_sock_sender = socket(AF_INET, SOCK_DGRAM, 0);
 	memset(&_addr, 0, sizeof(_addr));
 	_addr.sin_addr.s_addr = inet_addr(faddr);
@@ -79,56 +105,101 @@ int init_aec(HWND hwnd, char *faddr, unsigned short fport, unsigned short lport)
 	_addr.sin_port = htons(fport);
 	sprintf(forge_addr, "%s:%u", faddr, fport);
 	printf("sender voice to %s\n", forge_addr);
+	return 0;
+}
 
+int init_direct_sound(HWND hwnd)
+{
+	CoInitialize(0);
+	_hwnd = hwnd;
+	_hnotify[0] = CreateEvent(0, 0, 0, 0);
+	_hnotify[1] = CreateEvent(0, 0, 0, 0);
+	_work_notify = CreateEvent(0, 0, 0, 0);
 	InitializeCriticalSection(&_buf_lock);
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
 	if (open_speaker_mic() != 0)
 	{
 		printf("open speaker failed\n");
+		return -2;
+	}
+	return 0;
+}
+
+int direct_sound_ctrl(unsigned int flags)
+{
+	if (flags == _DS_STOP)
+	{
+		_status_play = 0;
+		WaitForSingleObject(_work_notify, -1);
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+	}
+	else
+	{
+        _status_play = 1;
+		HRESULT hr;
+		ResetEvent(_work_notify);
+		HANDLE th = (HANDLE)_beginthreadex(0, 0, thread_work, 0, 0, 0);
+		SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
+
+		if (flags & _DS_CAPTURE)
+			hr = _ds_capture_buffer->Start(DSCBSTART_LOOPING);
+		if (flags & _DS_PLAYBACK)
+			hr = _ds_playback_buffer->Play(0, 0, DSBPLAY_LOOPING);
+		
+	}
+
+	return 0;
+}
+
+static void set_handler(void *userp, sound_data_handler_t handler, int is_capture)
+{
+	if (is_capture)
+	{
+		_capture_handler = handler;
+		_capture_user = userp;
+	}
+	else
+	{
+		_playback_handler = handler;
+		_playback_user = userp;
+	}
+}
+
+int init_aec(HWND hwnd, char *faddr, unsigned short fport, unsigned short lport)
+{
+	WSADATA data;
+	WSAStartup(0x202, &data);
+
+	if ( 0 != init_udp_sock(faddr, fport, lport) )
+		return -1;
+	_playback_buf.allocate(BUFSIZE * 20);
+
+	if (init_direct_sound(hwnd) != 0)
+	{
 		closesocket(_sock_sender);
 		closesocket(_sock_listen);
 		return -2;
 	}
-	hr = _ds_capture_buffer->Start(DSCBSTART_LOOPING);
-	hr = _ds_playback_buffer->Play(0, 0, DSBPLAY_LOOPING);
 
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-	HANDLE th = (HANDLE)_beginthreadex(0, 0, thread_work, 0, 0, 0);
- 	SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
+	set_handler(0, demo_cap_handler, 1);
+	set_handler(0, demo_pb_handler, 0);
+	direct_sound_ctrl(_DS_CAPTURE | _DS_PLAYBACK);
 	_beginthreadex(0, 0, thread_listen, 0, 0, 0);
-	
 	return 0;
 }
 
-void error_print(HRESULT hr)
+void lock_buffer(void)
 {
-	switch (hr)
-	{
-	case DSERR_ALLOCATED:
-		printf("DSERR_ALLOCATED \n");
-		break;
-	case DSERR_INVALIDCALL: 
-		printf( "DSERR_INVALIDCALL \n" );	
-		break; 
-	case DSERR_INVALIDPARAM:
-		printf("DSERR_INVALIDPARAM \n");
-		break;
-	case DSERR_NOAGGREGATION:
-		printf("DSERR_NOAGGREGATION \n");
-		break;
-	case DSERR_NODRIVER:
-		printf("DSERR_NODRIVER \n");
-		break;
-	case DSERR_OUTOFMEMORY:
-		printf("DSERR_OUTOFMEMORY \n");
-		break;
-	default:
-		printf("unknow error %ld\n", hr);
-		break;
-	}
+	EnterCriticalSection(&_buf_lock);
 }
-#define  SAMPLE_RATE 8000
-int open_speaker_mic()
+
+void unlock_buffer(void)
+{
+	LeaveCriticalSection(&_buf_lock);
+}
+
+static int open_speaker_mic()
 {
 	HRESULT hr;
 	int i;
@@ -199,7 +270,7 @@ int open_speaker_mic()
 	cdesc.lpwfxFormat = &wfx;
 #endif
 
-	hr = DirectSoundFullDuplexCreate(0, 0,
+	hr = DirectSoundFullDuplexCreate8(0, 0,
 		&cdesc, &desc, _hwnd, 
 		DSSCL_PRIORITY,
 		&_ds_fp, 
@@ -208,8 +279,7 @@ int open_speaker_mic()
 		0);
 	if ((hr != DS_OK))
 	{
-		int error = WSAGetLastError();
-		error_print(hr);
+        printf("DirectSoundFullDuplexCreate8 failed %ld\n", hr);
 		return -1;
 	}
 
@@ -227,8 +297,6 @@ int open_speaker_mic()
 	if (FAILED(hr))
 	{
 		printf("pb buffer QueryInterface failed %ld\n", hr);
-		printf("device on support\n");
-		int error = WSAGetLastError();
 		return -1;
 	}
 	for (i = 0; i < BUFS; i++) {
@@ -247,7 +315,7 @@ static unsigned __stdcall thread_work (void *param)
 	unsigned char buf_out[BUFSIZE];
 	unsigned char buf_in[BUFSIZE];
 
-	while (1) 
+	while (_status_play) 
 	{
 
 	DWORD rc = WaitForMultipleObjects(2, _hnotify, FALSE, -1);
@@ -264,19 +332,7 @@ static unsigned __stdcall thread_work (void *param)
 			fprintf(stderr, "%s: capture Lock err\n", "thread_work");
 			exit(-1);
 		}
-		
-#if 0		// save
-		if (_capture_buf.freespace() < BUFSIZE) {
-			fprintf(stderr, "\n%s: capture buf overflow!!!!\n", "thread_work");
-			// exit(-1);
-			//util_cbuf_consume(_cbuf_input, CBUFSIZE/2);
-			_capture_buf.data_clear(); // 清空得了
-		}
-
-		_capture_buf.push_back((unsigned char *)p1, l1);
-		_capture_buf.push_back((unsigned char *)p2, l2);
-#endif
-		
+			
 		if (l1 >= BUFSIZE) {
 			memcpy(buf_in, p1, l1);
 		}
@@ -286,14 +342,18 @@ static unsigned __stdcall thread_work (void *param)
 		}
 
 		_ds_capture_buffer->Unlock(p1, l1, p2, l2);
-// 		printf("send voice to %s\n", forge_addr);
-		send_pcm((char *)buf_in, BUFSIZE);
+
+		lock_buffer();
+		if (_capture_handler)
+			(*_capture_handler) (_capture_user, buf_in, BUFSIZE);
+		unlock_buffer();
 	}
 	else
 	{
 		memset(buf_out, 0, BUFSIZE);
 		EnterCriticalSection(&_buf_lock);
-		_playback_buf.pop_front(buf_out, BUFSIZE);
+		if (_playback_handler)
+			(*_playback_handler)(_playback_user, buf_out, BUFSIZE);	
 		LeaveCriticalSection(&_buf_lock);
 
 		DWORD wp, pp;
@@ -302,7 +362,6 @@ static unsigned __stdcall thread_work (void *param)
 		void *p1, *p2;
 		DWORD l1, l2;
 		hr = _ds_playback_buffer->Lock(wp, BUFSIZE, &p1, &l1, &p2, &l2, 0);
-		//hr = _ds_playback_buffer->Lock(pos_write, BUFSIZE, &p1, &l1, &p2, &l2, 0);
 		if (hr != S_OK)
 		{
 			fprintf(stderr, "\n%s: playback Lock err\n", "thread_work");
@@ -319,6 +378,7 @@ static unsigned __stdcall thread_work (void *param)
 		hr = _ds_playback_buffer->Unlock(p1, l1, p2, l2);
 	}
 	}
+    SetEvent(_work_notify);
 	return 0;
 }
 
@@ -329,7 +389,7 @@ static unsigned __stdcall thread_listen (void *param)
 		sockaddr_in from;
 		int len = sizeof(from);
 		int rc = recvfrom(_sock_listen, buf, sizeof(buf), 0, (sockaddr*)&from, &len);
-		EnterCriticalSection(&_buf_lock);
+		lock_buffer();
 		if (rc > 0) {
 // 			printf("recv data %d bytes\n", rc);
 			if (_playback_buf.freespace() < (size_t)rc) {
@@ -342,8 +402,9 @@ static unsigned __stdcall thread_listen (void *param)
 			fprintf(stderr, "%s: recvfrom err\n", "thread_listen");
 			exit(-1);
 		}
-		LeaveCriticalSection(&_buf_lock);
+		unlock_buffer();
 	}
 	
 	return 0;
 }
+
