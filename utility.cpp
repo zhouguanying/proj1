@@ -3,7 +3,7 @@
 #include <assert.h>
 #include <string.h>
 
-DataChunk::DataChunk() 
+BufferChunk::BufferChunk() 
 {
 	m_data = 0;
 	m_size = 0;
@@ -12,12 +12,12 @@ DataChunk::DataChunk()
 	m_freespace = 0;
 }
 
-DataChunk::~DataChunk()
+BufferChunk::~BufferChunk()
 {
 	release();
 }
 
-void DataChunk::allocate(size_t size)
+void BufferChunk::allocate(size_t size)
 {
 	assert(size > 0);
 	
@@ -26,13 +26,13 @@ void DataChunk::allocate(size_t size)
 	m_readpos = m_writepos = 0;
 }
 
-void DataChunk::data_clear()
+void BufferChunk::data_clear()
 {
 	m_writepos = m_readpos = 0;
 	m_freespace = m_size;
 }
 
-void DataChunk::release()
+void BufferChunk::release()
 {
 	if (m_data)
 	{
@@ -41,7 +41,7 @@ void DataChunk::release()
 	}
 }
 
-size_t DataChunk::push_back(unsigned char *data, size_t size)
+size_t BufferChunk::push_back(unsigned char *data, size_t size)
 {
 	size_t s = size;
 	if (m_freespace < s) 
@@ -63,7 +63,7 @@ size_t DataChunk::push_back(unsigned char *data, size_t size)
 	return s;
 }
 
-size_t DataChunk::pop_front(unsigned char *rcv, size_t size)
+size_t BufferChunk::pop_front(unsigned char *rcv, size_t size)
 {
 	size_t s = size;
 	if (s > m_size - m_freespace)

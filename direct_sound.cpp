@@ -46,8 +46,8 @@ void set_handler_playback(void *userp, sound_data_handler_t handler)
 
 
 // data buf
-DataChunk _capture_buf;
-DataChunk _playback_buf;
+BufferChunk _capture_buf;
+BufferChunk _playback_buf;
 
 // for demo
 SOCKET _sock_sender;

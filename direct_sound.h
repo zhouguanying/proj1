@@ -13,7 +13,8 @@ int init_aec(HWND hwnd, char *faddr, unsigned short fport, unsigned short lport)
 
 void lock_buffer(void);
 void unlock_buffer(void);
-int init_direct_sound(HWND hwnd, size_t cap_buf_size, size_t pb_buf_size);
-void set_handler(void *userp, sound_data_handler_t handler, int is_capture);
+int init_direct_sound(HWND hwnd);
+void set_handler_capture(void *userp, sound_data_handler_t handler);
+void set_handler_playback(void *userp, sound_data_handler_t handler);
 int direct_sound_ctrl(unsigned int flags); //参数是位设置
 #endif

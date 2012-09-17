@@ -2,7 +2,7 @@
 #define _UTILITY_
 #include <stdlib.h>
 
-struct DataChunk
+struct BufferChunk
 {
 	size_t m_size;
 	size_t m_freespace;
@@ -10,8 +10,8 @@ struct DataChunk
 	int m_readpos;
 	int m_writepos;
 	
-	DataChunk();
-	~DataChunk();
+	BufferChunk();
+	~BufferChunk();
 	
 	void allocate(size_t size);
 	void release(void);
