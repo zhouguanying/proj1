@@ -39,6 +39,7 @@ void BufferChunk::release()
 		delete [] m_data;
 		m_data = 0;
 	}
+	data_clear();
 }
 
 size_t BufferChunk::push_back(unsigned char *data, size_t size)

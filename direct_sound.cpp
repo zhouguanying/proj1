@@ -15,6 +15,7 @@ static HWND _hwnd = 0;
 static HANDLE _hnotify[2];
 static HANDLE _work_notify;
 static CRITICAL_SECTION _buf_lock;
+static CRITICAL_SECTION _ctrl_lock;
 //play control
 static int _status_play = 0;
 static int _status_capture = 0;
@@ -116,6 +117,7 @@ int init_direct_sound(HWND hwnd)
 	_hnotify[1] = CreateEvent(0, 0, 0, 0);
 	_work_notify = CreateEvent(0, 0, 0, 0);
 	InitializeCriticalSection(&_buf_lock);
+	InitializeCriticalSection(&_ctrl_lock);
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
 	if (open_speaker_mic() != 0)
@@ -130,22 +132,30 @@ int direct_sound_ctrl(unsigned int flags)
 {
 	if (flags == _DS_STOP)
 	{
-		_status_play = 0;
-		WaitForSingleObject(_work_notify, -1);
-		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+// 		EnterCriticalSection(&_ctrl_lock);
+		if (_status_play)
+		{
+			_status_play = 0;
+			WaitForSingleObject(_work_notify, -1);
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+		}
+// 		LeaveCriticalSection(&_ctrl_lock)
 	}
 	else
 	{
-        _status_play = 1;
-		HRESULT hr;
-		ResetEvent(_work_notify);
-		HANDLE th = (HANDLE)_beginthreadex(0, 0, thread_work, 0, 0, 0);
-		SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
-
-		if (flags & _DS_CAPTURE)
-			hr = _ds_capture_buffer->Start(DSCBSTART_LOOPING);
-		if (flags & _DS_PLAYBACK)
-			hr = _ds_playback_buffer->Play(0, 0, DSBPLAY_LOOPING);
+		if (!_status_play)
+		{
+			_status_play = 1;
+			HRESULT hr;
+			ResetEvent(_work_notify);
+			HANDLE th = (HANDLE)_beginthreadex(0, 0, thread_work, 0, 0, 0);
+			SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
+			
+			if (flags & _DS_CAPTURE)
+				hr = _ds_capture_buffer->Start(DSCBSTART_LOOPING);
+			if (flags & _DS_PLAYBACK)
+				hr = _ds_playback_buffer->Play(0, 0, DSBPLAY_LOOPING);
+		}
 		
 	}
 

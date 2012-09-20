@@ -17,6 +17,7 @@ struct BufferChunk
 	void release(void);
 
 	size_t freespace(void) {return m_freespace; }
+	size_t data_size(void) {return m_size - m_freespace;}
 	
 	size_t push_back(unsigned char *data, size_t size);
 	size_t pop_front(unsigned char *rcv,  size_t size);
